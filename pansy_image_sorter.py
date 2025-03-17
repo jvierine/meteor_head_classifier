@@ -27,9 +27,6 @@ def label_images(base_path):
     create_directories(base_path, categories.values())
     import glob
     images=glob.glob(image_directory)
-    #print(images)
-    #images = [f for f in os.listd
-    ir(image_folder) if f.lower().endswith(('png', 'jpg', 'jpeg'))]
     
     for image in images:
         image_path = image#osimage#.path.join(image_folder, image)
