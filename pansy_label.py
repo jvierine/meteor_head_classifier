@@ -9,7 +9,7 @@ tf.config.experimental.list_physical_devices()
 import cv2
 
 # Set directory path to dataset
-dataset_path = "/data1/pansy/sorted_images"  # Change this to your actual dataset path
+dataset_path =r"C:\Users\ragav\meteor_head_classifier\data1\pansy\sorted_images2"  # Dataset path
 
 # Load images from directories, split into training and validation sets
 batch_size = 32
@@ -39,12 +39,12 @@ print(f"Class names: {class_names}")
 
 
 # Load the trained model
-model = load_model("image_classifier.h5")
+model = load_model("finetuned.keras")
 
 def label_image(img_path):
     # Load an image for prediction
     #img_path = "path/to/image.png"
-    img = image.load_img(img_path, target_size=(256, 256))
+    img = image.load_img(img_path, target_size=(224, 224))
     img_array = image.img_to_array(img)
     img_array = np.expand_dims(img_array, axis=0) / 255.0  # Normalize
 
@@ -56,7 +56,7 @@ def label_image(img_path):
     # plot 
     img = cv2.imread(img_path)
     # Scale factor (increase by 2x)
-    scale = 4.0  
+    scale = 2.0  
     width = int(img.shape[1] * scale)
     height = int(img.shape[0] * scale)
     resized = cv2.resize(img, (width, height))
@@ -81,7 +81,7 @@ def label_image(img_path):
 import glob
 
 
-fl=glob.glob("/data1/pansy/cnn_images/cnn*.png")
+fl=glob.glob(r"C:\Users\ragav\code\meteor_head_classifier\data1\pansy\cnn_images\cnn*.png")
 np.random.shuffle(fl)
 for f in fl:
     print(f)
