@@ -8,6 +8,7 @@ import csv
 import glob
 import json
 import random
+import argparse
 from collections import defaultdict
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
@@ -27,7 +28,13 @@ os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 tf.config.optimizer.set_jit(False)
 
 # ============================= CONFIG ==============================================
-DATA_ROOT = "/mnt/c/Users/ragav/meteor_head_classifier/data1/pansy/sorted_images2"
+parser = argparse.ArgumentParser(description="Train a ConvNeXt probe with custom dataset path.")
+parser.add_argument("--data_root", type=str, required=True,
+                    help="Path to the root directory of sorted image folders.")
+args = parser.parse_args()
+DATA_ROOT = args.data_root
+
+
 
 # Default backbone (sweep disabled by default) — lock to e5
 SSL_BACKBONE_PATH = "./ssl_ckpts/convnext_tiny_ssl_e5.keras"
