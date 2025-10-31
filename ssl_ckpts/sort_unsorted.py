@@ -1,5 +1,5 @@
 import os, sys, argparse, json, shutil, pathlib
-# --- Hard-disable XLA/JIT & expensive autotune BEFORE importing TF ---
+# --- Disable XLA/JIT & expensive autotune BEFORE importing TF ---
 os.environ.setdefault("TF_XLA_FLAGS", "--tf_xla_auto_jit=0")
 os.environ.setdefault("XLA_FLAGS", "--xla_gpu_autotune_level=1 --xla_gpu_enable_triton_gemm=false")
 os.environ.setdefault("TF_USE_CUDNN_AUTOTUNE", "0")
@@ -13,8 +13,10 @@ tf.config.optimizer.set_jit(False)
 # Try to enable GPU memory growth
 gpus = tf.config.list_physical_devices("GPU")
 if gpus:
-    try: tf.config.experimental.set_memory_growth(gpus[0], True)
-    except Exception as e: print("GPU memory growth not set:", e)
+    try:
+        tf.config.experimental.set_memory_growth(gpus[0], True)
+    except Exception as e:
+        print("GPU memory growth not set:", e)
 
 # ===== ConvNeXt preprocess layer (must match training) =====
 from tensorflow.keras.applications import convnext as keras_convnext
@@ -24,14 +26,23 @@ class ConvNeXtPreprocess(tf.keras.layers.Layer):
     def call(self, x):  # expects float32 in [0..255]
         return keras_convnext.preprocess_input(x)
 
-# ------------ utils ------------
-IMG_EXTS = {".jpg",".jpeg",".png",".bmp",".gif",".tif",".tiff"}
+# --- Shim for models saved with Lambda(function='preprocess_input') ---
+from tensorflow.keras.applications.convnext import preprocess_input as _convnext_preprocess_input
 
-def list_images(root: str, recursive: bool):
+@tf.keras.utils.register_keras_serializable(package="custom", name="preprocess_input")
+def preprocess_input(x):
+    """Shim for models saved with Lambda(function='preprocess_input')."""
+    return _convnext_preprocess_input(x)
+
+globals()["function"] = preprocess_input  # needed for legacy builtins.function references
+
+# ------------ utils ------------
+IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".tif", ".tiff"}
+
+def list_images(root: str):
+    """List all image files (non-recursive)."""
     p = pathlib.Path(root)
-    it = (q for q in (p.rglob("*") if recursive else p.glob("*"))
-          if q.is_file() and q.suffix.lower() in IMG_EXTS)
-    return [str(q) for q in it]
+    return [str(q) for q in p.glob("*") if q.is_file() and q.suffix.lower() in IMG_EXTS]
 
 def safe_makedirs(path: str):
     pathlib.Path(path).mkdir(parents=True, exist_ok=True)
@@ -57,37 +68,17 @@ def build_decoder(image_size: int):
         return img
     return _decode
 
-# ---------- TTA helpers ----------
-@tf.function(reduce_retracing=True, jit_compile=False)
-def _pad_crop_shift(x, dy, dx):
-    H = tf.shape(x)[1]; W = tf.shape(x)[2]
-    pad_t = tf.maximum(dy, 0); pad_b = tf.maximum(-dy, 0)
-    pad_l = tf.maximum(dx, 0); pad_r = tf.maximum(-dx, 0)
-    xpad = tf.pad(x, [[0,0],[pad_t,pad_b],[pad_l,pad_r],[0,0]], mode="REFLECT")
-    return tf.image.crop_to_bounding_box(xpad, offset_height=pad_b, offset_width=pad_r,
-                                         target_height=H, target_width=W)
-
-def build_infer_fn(model, img_size: int, flip: bool, shift_px: int):
+# ---------- inference ----------
+def build_infer_fn(model, img_size: int):
     @tf.function(
         input_signature=[tf.TensorSpec([None, img_size, img_size, 3], tf.float16)],
         reduce_retracing=True, jit_compile=False
     )
     def infer(x):
-        x32 = tf.cast(x, tf.float32)
+        x32 = tf.cast(x, tf.float32)   # model expects float32 0..255; ConvNeXtPreprocess handles normalization
         y = model(x32, training=False)
         return tf.cast(y, tf.float32)
-
-    def predict_with_tta(x):
-        preds = [infer(x)]
-        if flip:
-            preds.append(infer(tf.image.flip_up_down(x)))
-        if isinstance(shift_px, int) and shift_px > 0:
-            preds.append(infer(_pad_crop_shift(x,  shift_px,  0)))
-            preds.append(infer(_pad_crop_shift(x, -shift_px,  0)))
-            preds.append(infer(_pad_crop_shift(x,  0,  shift_px)))
-            preds.append(infer(_pad_crop_shift(x,  0, -shift_px)))
-        return tf.add_n(preds) / float(len(preds))
-    return infer, predict_with_tta
+    return infer
 
 # ---------- dataset ----------
 def make_ds(paths, batch, image_size):
@@ -104,60 +95,66 @@ def make_ds(paths, batch, image_size):
 # ---------- main ----------
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--input_dir", required=True)
-    ap.add_argument("--out_dir",   required=True)
-    ap.add_argument("--model",     default="finetuned_ema.keras")
-    ap.add_argument("--class_file", default="ssl_ckpts/class_names.json")
-    ap.add_argument("--batch", type=int, default=32)
-    ap.add_argument("--tta_shift", type=int, default=3)
-    ap.add_argument("--flip", action="store_true")
-    ap.add_argument("--min_conf", type=float, default=0.55)
-    ap.add_argument("--move", action="store_true", help="move files instead of copy")
-    ap.add_argument("--recursive", action="store_true")
+    ap.add_argument("--input_dir", required=True, help="Folder of unsorted images.")
+    ap.add_argument("--out_dir",   required=True, help="Output root where class folders will be created.")
+    ap.add_argument("--model",     required=True, help="Path to .keras/.h5 or SavedModel directory.")
+    ap.add_argument("--class_file", required=True, help="class_names.json mapping used at training time.")
+    ap.add_argument("--batch", type=int, default=32, help="Inference batch size (perf only).")
+    ap.add_argument("--min_conf", type=float, default=0.55, help="Min softmax prob to assign; else goes to _low_conf.")
+    ap.add_argument("--move", action="store_true", help="Move files instead of copy (destructive).")
     args = ap.parse_args()
 
-    # Load model (provide custom layer mapping)
+    # Load model (map missing function names)
     custom_objects = {
         "ConvNeXtPreprocess": ConvNeXtPreprocess,
-        "custom>ConvNeXtPreprocess": ConvNeXtPreprocess,  # just in case
+        "custom>ConvNeXtPreprocess": ConvNeXtPreprocess,
+        "preprocess_input": preprocess_input,
+        "function": preprocess_input,
     }
-    model = tf.keras.models.load_model(args.model, compile=False, custom_objects=custom_objects)
+
+    model = tf.keras.models.load_model(
+        args.model,
+        compile=False,
+        custom_objects=custom_objects,
+        safe_mode=False,
+    )
     model.trainable = False
 
-    # Expected input size
     in_shape = model.inputs[0].shape
     h, w = int(in_shape[1]), int(in_shape[2])
     assert h == w and h is not None, f"Unexpected model input shape {in_shape}"
     print(f"Loaded {args.model} | expects input {h}x{w}", end="")
 
-    # Class names
     out_dim = int(model.outputs[0].shape[-1])
     classes = load_class_names(args.class_file, out_dim)
     print(f" | classes={classes}")
 
-    # Collect images
-    paths = list_images(args.input_dir, args.recursive)
+    paths = list_images(args.input_dir)
     if not paths:
         print("No images found. Exiting.")
         return
     print(f"Found {len(paths)} images to sort.")
 
-    # Build ds & infer fns
     ds = make_ds(paths, args.batch, h)
-    infer, predict_with_tta = build_infer_fn(model, h, args.flip, args.tta_shift)
+    infer = build_infer_fn(model, h)
 
-    # Output dirs
-    for c in classes: safe_makedirs(os.path.join(args.out_dir, c))
-    low_conf_dir = os.path.join(args.out_dir, "_low_conf"); safe_makedirs(low_conf_dir)
+    # Prepare output dirs
+    for c in classes:
+        safe_makedirs(os.path.join(args.out_dir, c))
+    low_conf_dir = os.path.join(args.out_dir, "_low_conf")
+    safe_makedirs(low_conf_dir)
 
-    # Run
-    moved, copied = 0, 0
+    moved, copied, total = 0, 0, len(paths)
+    processed = 0
+
     for batch_paths, batch_imgs in ds:
-        probs = predict_with_tta(batch_imgs).numpy() if (args.flip or args.tta_shift > 0) else infer(batch_imgs).numpy()
+        logits = infer(batch_imgs).numpy()
+        probs = tf.nn.softmax(logits, axis=1).numpy()
         pred_idx = probs.argmax(axis=1)
         conf = probs.max(axis=1)
 
         for i in range(len(pred_idx)):
+            processed += 1
             p = batch_paths[i].numpy().decode("utf-8")
             dst_dir = os.path.join(args.out_dir, classes[int(pred_idx[i])]) if conf[i] >= args.min_conf else low_conf_dir
             safe_makedirs(dst_dir)
@@ -173,6 +170,9 @@ def main():
                     shutil.copy2(p, final); copied += 1
             except Exception as e:
                 print(f"[WARN] failed to {'move' if args.move else 'copy'} {p} -> {dst_dir}: {e}")
+
+            if processed % 100 == 0 or processed == total:
+                print(f"Progress: {processed}/{total} images processed")
 
     print(f"Done. {'Moved' if args.move else 'Copied'}: {moved if args.move else copied} files.")
 

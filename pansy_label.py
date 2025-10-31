@@ -8,9 +8,9 @@ os.environ.setdefault("TF_USE_CUDNN_AUTOTUNE", "0")
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 
 import re
-import glob
 import sys
 import json
+import argparse
 import numpy as np
 import tensorflow as tf
 from pathlib import Path
@@ -29,6 +29,9 @@ import matplotlib.pyplot as plt
 # ---------- Helpers ----------
 
 def to_wsl_path(p: str) -> str:
+    """Convert Windows 'C:\\...' to WSL '/mnt/c/...' when running on Linux."""
+    if not p:
+        return p
     if os.name == "posix" and re.match(r"^[A-Za-z]:\\", p):
         drive = p[0].lower()
         rest = p[2:].replace("\\", "/")
@@ -81,12 +84,9 @@ def function(x):
 builtins.preprocess_input = preprocess_input
 builtins.function = function
 
-# Construct a reusable custom_objects dict
 CUSTOM_OBJECTS = {
-    # layers
     "ConvNeXtPreprocess": ConvNeXtPreprocess,
     "custom>ConvNeXtPreprocess": ConvNeXtPreprocess,
-    # functions
     "preprocess_input": preprocess_input,
     "function": function,
     "builtins.preprocess_input": preprocess_input,
@@ -94,64 +94,41 @@ CUSTOM_OBJECTS = {
 }
 
 def try_load_model_any(path_candidate: str):
-    """
-    Attempts to load a Keras model given a file OR directory.
-    Supports:
-      - *.keras (ZIP format)
-      - *.h5 / *.hdf5
-      - SavedModel directory (contains saved_model.pb or keras_metadata.pb)
-    """
+    """Load a Keras model from a file or SavedModel directory."""
     if os.path.isfile(path_candidate):
         print(f"Attempting to load model file: {path_candidate}")
-        return load_model(
-            path_candidate,
-            compile=False,                # avoid needing optimizers/losses during load
-            custom_objects=CUSTOM_OBJECTS,
-            safe_mode=False,              # allow legacy callables
-        )
+        return load_model(path_candidate, compile=False, custom_objects=CUSTOM_OBJECTS, safe_mode=False)
 
     if os.path.isdir(path_candidate):
-        # Detect SavedModel dir
-        has_pb = os.path.isfile(os.path.join(path_candidate, "saved_model.pb"))
-        has_keras_meta = os.path.isfile(os.path.join(path_candidate, "keras_metadata.pb"))
-        if has_pb or has_keras_meta:
+        if os.path.isfile(os.path.join(path_candidate, "saved_model.pb")) or \
+           os.path.isfile(os.path.join(path_candidate, "keras_metadata.pb")):
             print(f"Attempting to load SavedModel directory: {path_candidate}")
-            return load_model(
-                path_candidate,
-                compile=False,
-                custom_objects=CUSTOM_OBJECTS,
-                safe_mode=False,
-            )
+            return load_model(path_candidate, compile=False, custom_objects=CUSTOM_OBJECTS, safe_mode=False)
 
     raise FileNotFoundError(f"No model found at: {path_candidate}")
 
 def smart_find_and_load_model(preferred_path: str):
-    """
-    If preferred_path doesn't exist, auto-search in its directory for likely candidates.
-    Tries (in order): .keras, .h5/.hdf5, SavedModel directory.
-    """
+    """Try to load model from various file extensions and locations."""
+    import glob
     preferred_path = to_wsl_path(preferred_path)
     parent = os.path.dirname(preferred_path) or "."
-    stem = Path(preferred_path).stem  # 'finetuned' from 'finetuned.keras'
+    stem = Path(preferred_path).stem
 
-    # 1) Exact path
     if os.path.exists(preferred_path):
         return try_load_model_any(preferred_path)
 
     print(f"[INFO] Preferred model not found: {preferred_path}")
     list_dir(parent)
 
-    # 2) Alternate extensions next to it
     candidates = [
         os.path.join(parent, stem + ext)
         for ext in (".keras", ".h5", ".hdf5")
     ] + [
-        os.path.join(parent, stem),               # SavedModel dir named 'finetuned'
-        os.path.join(parent, "saved_model"),      # common name
-        os.path.join(parent, "model"),            # another common name
+        os.path.join(parent, stem),
+        os.path.join(parent, "saved_model"),
+        os.path.join(parent, "model"),
     ]
 
-    # 3) Also look for any *.keras/*.h5 in the folder
     candidates += sorted(glob.glob(os.path.join(parent, "*.keras")))
     candidates += sorted(glob.glob(os.path.join(parent, "*.h5")))
     candidates += sorted(glob.glob(os.path.join(parent, "*.hdf5")))
@@ -164,171 +141,141 @@ def smart_find_and_load_model(preferred_path: str):
             except Exception as e:
                 tried.append((c, str(e)))
 
-    msg = "[ERROR] Could not locate/load a model. Tried the following paths:\n"
+    msg = "[ERROR] Could not locate/load a model. Tried:\n"
     for c, err in tried:
         msg += f"  - {c}  --> {err}\n"
     raise FileNotFoundError(msg)
 
-# ---------- User paths (Windows style; auto-converted on WSL) ----------
+# ---------- CLI ----------
 
-WIN_DATASET_DIR = r"C:\Users\ragav\meteor_head_classifier\data1\pansy\sorted_images2"
-# Use a directory (more robust than fragile 'cnn*.png' glob)
-WIN_PREDICT_DIR = r"C:\Users\ragav\meteor_head_classifier\data1\pansy\cnn_images"
-# This can be a file (.keras/.h5) OR a directory (SavedModel)
-WIN_MODEL_PATH  = r"C:\Users\ragav\meteor_head_classifier\finetuned.keras"
+def parse_args():
+    p = argparse.ArgumentParser(description="Label images with a Keras ConvNeXt model (no dataset needed).")
+    p.add_argument("--predict", required=True, help="Path to folder with images to label.")
+    p.add_argument("--model",   required=True, help="Path to model (.keras/.h5) or SavedModel directory.")
+    p.add_argument("--classes", required=True, help="Path to class_names.json (from training).")
+    return p.parse_args()
 
-# ---------- Derived paths ----------
+# ---------- Main ----------
 
-DATASET_DIR = to_wsl_path(WIN_DATASET_DIR)
-PREDICT_DIR = to_wsl_path(WIN_PREDICT_DIR)
-MODEL_PATH   = to_wsl_path(WIN_MODEL_PATH)
+def main():
+    args = parse_args()
 
-# ---------- Config ----------
+    PREDICT_DIR = to_wsl_path(args.predict)
+    MODEL_PATH  = to_wsl_path(args.model)
+    CLASS_FILE  = to_wsl_path(args.classes)
 
-BATCH_SIZE = 32
-# We'll detect the model's true input size after loading; this size is only for getting class names from folders:
-IMG_SIZE_FOR_DATASET = (224, 224)
+    print(f"Predict dir:  {PREDICT_DIR}")
+    print(f"Model path:   {MODEL_PATH}")
+    print(f"Class file:   {CLASS_FILE}")
 
-# ---------- Build datasets (for class_names) ----------
+    ensure_dir_exists(PREDICT_DIR, "Predict dir")
+    if not os.path.isfile(CLASS_FILE):
+        raise FileNotFoundError(f"class_names.json not found: {CLASS_FILE}")
 
-print(f"Using dataset dir: {DATASET_DIR}")
-print(f"Intended model path: {MODEL_PATH}")
-
-ensure_dir_exists(DATASET_DIR, "Dataset directory")
-
-train_ds = tf.keras.utils.image_dataset_from_directory(
-    DATASET_DIR,
-    validation_split=0.2,
-    subset="training",
-    seed=123,
-    image_size=IMG_SIZE_FOR_DATASET,
-    batch_size=BATCH_SIZE
-)
-
-val_ds = tf.keras.utils.image_dataset_from_directory(
-    DATASET_DIR,
-    validation_split=0.2,
-    subset="validation",
-    seed=123,
-    image_size=IMG_SIZE_FOR_DATASET,
-    batch_size=BATCH_SIZE
-)
-
-class_names = train_ds.class_names
-print(f"Class names (from folders): {class_names}")
-
-# Prefer the original training mapping if available to avoid class-order drift
-TRAIN_CLASS_FILE = to_wsl_path(r"C:\Users\ragav\meteor_head_classifier\ssl_ckpts\class_names.json")
-try:
-    if os.path.isfile(TRAIN_CLASS_FILE):
-        with open(TRAIN_CLASS_FILE, "r") as f:
-            names = json.load(f)
-        if isinstance(names, dict):
-            items = sorted(((int(k), v) for k, v in names.items()), key=lambda x: x[0])
-            class_names = [v for _, v in items]
-        elif isinstance(names, list):
-            class_names = names
-        print(f"Loaded class names from json: {class_names}")
-except Exception as e:
-    print(f"[INFO] Could not load class names from {TRAIN_CLASS_FILE}: {e}")
-
-# ---------- Load model robustly ----------
-
-model = smart_find_and_load_model(MODEL_PATH)
-print("Model loaded successfully.")
-
-# Determine the model's expected input size (e.g., 256)
-in_shape = model.inputs[0].shape
-h, w = int(in_shape[1]), int(in_shape[2])
-assert h is not None and h == w, f"Unexpected model input shape: {in_shape}"
-MODEL_IMG_SIZE = (h, w)
-print(f"Model expects input size: {MODEL_IMG_SIZE}")
-
-# ---------- Prediction & display ----------
-
-def predict_image_path(img_path: str) -> str:
-    # Resize to the model's actual expected size
-    img = image.load_img(img_path, target_size=MODEL_IMG_SIZE)
-    arr = image.img_to_array(img).astype("float32")  # 0..255 float32
-    arr = np.expand_dims(arr, axis=0)               # DO NOT divide by 255
-    preds = model.predict(arr, verbose=0)
-
-    # probs (handle logits vs probs)
-    if preds.ndim == 2:
-        probs = tf.nn.softmax(preds, axis=1).numpy()[0]
+    # Load class names from JSON only (no dataset usage)
+    with open(CLASS_FILE, "r") as f:
+        names = json.load(f)
+    if isinstance(names, dict):
+        items = sorted(((int(k), v) for k, v in names.items()), key=lambda x: x[0])
+        class_names = [v for _, v in items]
+    elif isinstance(names, list):
+        class_names = names
     else:
-        probs = preds[0]
+        raise ValueError("class_names.json must be a list or a dict of index->name")
+    print(f"Loaded class names: {class_names}")
 
-    top_idx = int(np.argmax(probs))
-    # optional: print top-3 for debugging
-    top3 = np.argsort(-probs)[:3]
-    print("Top-3:", [(class_names[i], float(probs[i])) for i in top3])
+    # Load model
+    model = smart_find_and_load_model(MODEL_PATH)
+    print("Model loaded successfully.")
 
-    return class_names[top_idx]
+    # Check model input
+    in_shape = model.inputs[0].shape
+    h, w = int(in_shape[1]), int(in_shape[2])
+    assert h is not None and h == w, f"Unexpected model input shape: {in_shape}"
+    MODEL_IMG_SIZE = (h, w)
+    print(f"Model expects input size: {MODEL_IMG_SIZE}")
 
-def show_image_cv2(img_path: str, window_title: str = "Label Image", scale: float = 2.0) -> None:
-    img = cv2.imread(img_path)
-    if img is None:
-        print(f"[WARN] Could not read image with cv2: {img_path}")
-        return
-    if scale != 1.0:
-        h0, w0 = img.shape[:2]
-        img = cv2.resize(img, (int(w0 * scale), int(h0 * scale)))
-    cv2.imshow(window_title, img)
-    key = cv2.waitKey(0) & 0xFF
-    cv2.destroyAllWindows()
-    if chr(key) == "x":
-        print("Exiting on 'x' key.")
-        sys.exit(0)
+    # Sanity check: output dims match class count
+    out_dim = int(model.outputs[0].shape[-1])
+    if out_dim != len(class_names):
+        raise ValueError(f"Model output dim ({out_dim}) != number of classes ({len(class_names)}).")
 
-def show_image_matplotlib(img_path: str, title: str = "Label Image") -> None:
-    if OPENCV_AVAILABLE:
-        img_bgr = cv2.imread(img_path)
-        if img_bgr is None:
-            print(f"[WARN] Could not read image: {img_path}")
+    # Collect images
+    IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
+    files = [str(p) for p in Path(PREDICT_DIR).glob("*") if p.suffix.lower() in IMG_EXTS]
+    if not files:
+        print(f"[INFO] No images in: {PREDICT_DIR}")
+        list_dir(PREDICT_DIR)
+        raise FileNotFoundError(f"No images found in: {PREDICT_DIR}")
+
+    np.random.shuffle(files)
+    print(f"Found {len(files)} files to label.")
+
+    def predict_image_path(img_path: str) -> str:
+        # Resize to the model's actual expected size; keep 0..255 float
+        img = image.load_img(img_path, target_size=MODEL_IMG_SIZE)
+        arr = image.img_to_array(img).astype("float32")
+        arr = np.expand_dims(arr, axis=0)  # DO NOT divide by 255 (preprocess layer handles it)
+        preds = model.predict(arr, verbose=0)
+
+        # Convert logits->probs if needed
+        if preds.ndim == 2:
+            probs = tf.nn.softmax(preds, axis=1).numpy()[0]
+        else:
+            probs = preds[0]
+
+        top_idx = int(np.argmax(probs))
+        # Optional: print per-class probabilities for debugging
+        print("Probabilities:", {class_names[i]: float(probs[i]) for i in range(len(class_names))})
+        return class_names[top_idx]
+
+    def show_image_cv2(img_path: str, window_title: str = "Label Image", scale: float = 2.0):
+        img = cv2.imread(img_path)
+        if img is None:
+            print(f"[WARN] Could not read image with cv2: {img_path}")
             return
-        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-    else:
-        pil_img = image.load_img(img_path)
-        img_rgb = np.array(pil_img)
+        if scale != 1.0:
+            h0, w0 = img.shape[:2]
+            img = cv2.resize(img, (int(w0 * scale), int(h0 * scale)))
+        cv2.imshow(window_title, img)
+        key = cv2.waitKey(0) & 0xFF
+        cv2.destroyAllWindows()
+        if chr(key) == "x":
+            print("Exiting on 'x' key.")
+            sys.exit(0)
 
-    plt.figure()
-    plt.imshow(img_rgb)
-    plt.title(title)
-    plt.axis("off")
-    plt.show(block=True)
+    def show_image_matplotlib(img_path: str, title: str = "Label Image"):
+        if OPENCV_AVAILABLE:
+            img_bgr = cv2.imread(img_path)
+            if img_bgr is None:
+                print(f"[WARN] Could not read image: {img_path}")
+                return
+            img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        else:
+            pil_img = image.load_img(img_path)
+            img_rgb = np.array(pil_img)
 
-    choice = input("Press 'n' for next or 'x' to exit: ").strip().lower()
-    if choice == "x":
-        print("Exiting on 'x'.")
-        sys.exit(0)
+        plt.figure()
+        plt.imshow(img_rgb)
+        plt.title(title)
+        plt.axis("off")
+        plt.show(block=True)
+        choice = input("Press 'n' for next or 'x' to exit: ").strip().lower()
+        if choice == "x":
+            print("Exiting on 'x'.")
+            sys.exit(0)
 
-def label_image(img_path: str) -> None:
-    pred = predict_image_path(img_path)
-    print(f"Predicted class: {pred}")
-    title = f"Predicted: {pred}"
-    if gui_available_for_opencv():
-        show_image_cv2(img_path, window_title=title, scale=2.0)
-    else:
-        show_image_matplotlib(img_path, title=title)
+    for f in files:
+        print(f"\nImage: {f}")
+        pred = predict_image_path(f)
+        print(f"Predicted class: {pred}")
+        title = f"Predicted: {pred}"
+        if gui_available_for_opencv():
+            show_image_cv2(f, window_title=title)
+        else:
+            show_image_matplotlib(f, title=title)
 
-# ---------- Run ----------
+    print("Done.")
 
-# Collect images from a directory instead of fragile globs
-IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
-ensure_dir_exists(PREDICT_DIR, "Predict dir")
-files = [str(p) for p in Path(PREDICT_DIR).glob("*") if p.suffix.lower() in IMG_EXTS]
-
-if not files:
-    print(f"[INFO] No images in: {PREDICT_DIR}")
-    list_dir(PREDICT_DIR)
-    raise FileNotFoundError(f"No images found in: {PREDICT_DIR}")
-
-np.random.shuffle(files)
-print(f"Found {len(files)} files to label.")
-
-for f in files:
-    print(f"\nImage: {f}")
-    label_image(f)
-
-print("Done.")
+if __name__ == "__main__":
+    main()
